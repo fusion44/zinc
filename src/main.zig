@@ -1518,7 +1518,9 @@ pub fn main() !void {
             .model_path = check_target.model_path,
             .requested_context_length = config.context_length,
             .managed_model = check_target.managed_model,
-            .shader_dir = if (gpu.is_metal) "src/shaders/metal" else "zig-out/share/zinc/shaders",
+            .shader_dir = if (gpu.is_metal) "src/shaders/metal" else blk: {
+                break :blk resolveShaderDir(allocator) catch "zig-out/share/zinc/shaders";
+            },
         }, allocator) catch |err| {
             log.err("Diagnostics completed with error: {s}", .{@errorName(err)});
             std.process.exit(1);
@@ -1758,8 +1760,14 @@ pub fn main() !void {
     const gpu_config = gpu_detect.detect(&vk_instance);
     gpu_config.log_info();
 
-    // Determine shader directory
-    const shader_dir = "zig-out/share/zinc/shaders";
+    // Determine shader directory — probe relative paths first, then fall back
+    // to a path relative to the running executable so that installed layouts
+    // (e.g. Nix store: $out/bin/zinc → $out/share/zinc/shaders) work correctly.
+    const shader_dir = resolveShaderDir(allocator) catch |err| {
+        log.err("Could not locate shader directory: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer allocator.free(shader_dir);
 
     if (config.prompt) |prompt| {
         var gpu_process_lock = process_lock_mod.acquire(.vulkan, vk_instance.selected_device_index) catch |err| {
@@ -2165,6 +2173,33 @@ test "resolveCheckTarget prefers managed model id over raw gguf path" {
     if (target.model_path) |path| {
         try std.testing.expect(!std.mem.eql(u8, path, "raw.gguf"));
     }
+}
+
+/// Locate the compiled SPIR-V shader directory.
+///
+/// Resolution order:
+/// 1. `zig-out/share/zinc/shaders`  — local dev build (CWD-relative)
+/// 2. `share/zinc/shaders`          — when CWD is the install prefix
+/// 3. `<exe_dir>/../share/zinc/shaders` — installed layout (Nix store, /usr/local, etc.)
+///
+/// Returns an allocated slice owned by the caller.
+fn resolveShaderDir(allocator: std.mem.Allocator) ![]u8 {
+    const candidates = [_][]const u8{
+        "zig-out/share/zinc/shaders",
+        "share/zinc/shaders",
+    };
+    for (candidates) |candidate| {
+        std.fs.cwd().access(candidate, .{}) catch continue;
+        return allocator.dupe(u8, candidate);
+    }
+    // Derive from the running executable's directory: bin/../share/zinc/shaders
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+    const derived = try std.fs.path.join(allocator, &.{ exe_dir, "..", "share", "zinc", "shaders" });
+    errdefer allocator.free(derived);
+    std.fs.cwd().access(derived, .{}) catch return error.ShaderDirNotFound;
+    return derived;
 }
 
 fn makeTestTokenizer(chat_template: ?[]const u8) tokenizer_mod.Tokenizer {
