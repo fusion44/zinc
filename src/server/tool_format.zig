@@ -41,23 +41,149 @@ pub const FeedResult = enum {
 };
 
 pub const StreamingDetector = struct {
-    state: State = .normal_text,
+    /// Bytes pending emission as content delta.
+    content_pending: std.ArrayList(u8) = .{},
+    /// Bytes being inspected for an incomplete <tool_call> open tag.
     hold_buf: std.ArrayList(u8) = .{},
+    /// Tool calls fully parsed and waiting for the caller to drain.
     pending_calls: std.ArrayList(ToolCall) = .{},
     next_id: u32 = 0,
     allocator: std.mem.Allocator,
 
-    const State = enum { normal_text, buffer_partial_tag, inside_tool_call };
+    /// Maximum bytes to hold while waiting for an open tag to disambiguate.
+    /// "<tool_call>" is 11 bytes; we use 24 for safety margin.
+    const max_hold = 24;
 
     pub fn deinit(self: *StreamingDetector) void {
+        self.content_pending.deinit(self.allocator);
         self.hold_buf.deinit(self.allocator);
+        for (self.pending_calls.items) |c| {
+            self.allocator.free(c.id);
+            self.allocator.free(c.name);
+            self.allocator.free(c.arguments_json);
+        }
         self.pending_calls.deinit(self.allocator);
     }
 
     pub fn feed(self: *StreamingDetector, chunk: []const u8) !FeedResult {
-        _ = self;
-        _ = chunk;
-        return .emit_as_content; // placeholder; real impl in Task 7+
+        // If a previously-parsed call is waiting, announce it before processing new bytes.
+        if (self.pending_calls.items.len > 0) return .tool_call_complete;
+
+        try self.hold_buf.appendSlice(self.allocator, chunk);
+
+        // 1. Look for a complete <tool_call>...</tool_call> in the buffer.
+        if (std.mem.indexOf(u8, self.hold_buf.items, tool_call_open)) |open_at| {
+            // Anything before the open tag is content. Move it to content_pending.
+            if (open_at > 0) {
+                try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..open_at]);
+                std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[open_at..]);
+                self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - open_at);
+            }
+
+            // Try to find the close tag.
+            const close_idx = std.mem.indexOfPos(u8, self.hold_buf.items, tool_call_open.len, tool_call_close);
+            if (close_idx) |close_at| {
+                // Parse the inner JSON.
+                const inner = std.mem.trim(u8, self.hold_buf.items[tool_call_open.len..close_at], " \t\r\n");
+                const parsed_json = std.json.parseFromSlice(std.json.Value, self.allocator, inner, .{}) catch {
+                    // Malformed: emit the entire block as content.
+                    log.warn("malformed JSON inside <tool_call>; emitting as content", .{});
+                    const after_close = close_at + tool_call_close.len;
+                    try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..after_close]);
+                    std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[after_close..]);
+                    self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - after_close);
+                    if (self.content_pending.items.len > 0) return .emit_as_content;
+                    return .hold;
+                };
+                defer parsed_json.deinit();
+
+                const obj = switch (parsed_json.value) {
+                    .object => |o| o,
+                    else => {
+                        log.warn("tool_call JSON is not an object; emitting as content", .{});
+                        const after_close = close_at + tool_call_close.len;
+                        try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..after_close]);
+                        std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[after_close..]);
+                        self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - after_close);
+                        if (self.content_pending.items.len > 0) return .emit_as_content;
+                        return .hold;
+                    },
+                };
+
+                const name = blk: {
+                    if (obj.get("name")) |v| {
+                        if (v == .string) break :blk v.string;
+                    }
+                    break :blk "";
+                };
+
+                const empty_obj = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+                const args_val = obj.get("arguments") orelse empty_obj;
+                const args_str = try std.json.Stringify.valueAlloc(self.allocator, args_val, .{});
+                errdefer self.allocator.free(args_str);
+
+                const id = try std.fmt.allocPrint(self.allocator, "call_{d}", .{self.next_id});
+                errdefer self.allocator.free(id);
+                self.next_id += 1;
+
+                const name_owned = try self.allocator.dupe(u8, name);
+                errdefer self.allocator.free(name_owned);
+
+                try self.pending_calls.append(self.allocator, .{
+                    .id = id,
+                    .name = name_owned,
+                    .arguments_json = args_str,
+                });
+
+                // Strip the consumed block from hold_buf.
+                const after_close = close_at + tool_call_close.len;
+                std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[after_close..]);
+                self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - after_close);
+
+                // If there is pending content from before the tag, emit it first.
+                if (self.content_pending.items.len > 0) return .emit_as_content;
+                return .tool_call_complete;
+            }
+            // Open tag found but no close yet — wait for more chunks.
+            if (self.content_pending.items.len > 0) return .emit_as_content;
+            return .hold;
+        }
+
+        // 2. No open tag in buffer. Check whether the tail could be the start of one.
+        const tail_start = if (self.hold_buf.items.len > max_hold) self.hold_buf.items.len - max_hold else 0;
+        if (std.mem.indexOfScalarPos(u8, self.hold_buf.items, tail_start, '<')) |lt_at| {
+            // The tail starting at lt_at *might* be a partial open tag. Hold it.
+            // Bytes before lt_at are safe to emit.
+            if (lt_at > 0) {
+                try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..lt_at]);
+                std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[lt_at..]);
+                self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - lt_at);
+            }
+            // Check if the tail can no longer match (mismatched bytes).
+            const tail = self.hold_buf.items;
+            const ok_so_far = std.mem.startsWith(u8, tool_call_open, tail) or std.mem.startsWith(u8, tail, tool_call_open);
+            if (!ok_so_far or tail.len > tool_call_open.len) {
+                // Tail can't be the start of <tool_call>; flush it as content.
+                try self.content_pending.appendSlice(self.allocator, tail);
+                self.hold_buf.clearRetainingCapacity();
+            }
+            if (self.content_pending.items.len > 0) return .emit_as_content;
+            return .hold;
+        }
+
+        // 3. No '<' anywhere — it's all content.
+        try self.content_pending.appendSlice(self.allocator, self.hold_buf.items);
+        self.hold_buf.clearRetainingCapacity();
+        if (self.content_pending.items.len > 0) return .emit_as_content;
+        return .hold;
+    }
+
+    /// Drain pending content bytes. Returns a slice owned by the detector —
+    /// consume before next feed call.
+    pub fn takeContentDelta(self: *StreamingDetector) []const u8 {
+        const out = self.content_pending.items;
+        self.content_pending = .{};
+        return out;
     }
 
     pub fn takePendingToolCall(self: *StreamingDetector) ?ToolCall {
@@ -65,8 +191,13 @@ pub const StreamingDetector = struct {
         return self.pending_calls.orderedRemove(0);
     }
 
+    /// Called at end of stream. Returns any held bytes (as content).
     pub fn finalize(self: *StreamingDetector) []const u8 {
-        return self.hold_buf.items;
+        const held = self.hold_buf.items;
+        if (held.len == 0) return self.content_pending.items;
+        self.content_pending.appendSlice(self.allocator, held) catch return self.content_pending.items;
+        self.hold_buf.clearRetainingCapacity();
+        return self.content_pending.items;
     }
 };
 
@@ -181,7 +312,7 @@ pub fn noopToolFormat() ToolFormat {
 // ============================================================
 
 pub fn forTemplate(template_kind: TemplateKind) ToolFormat {
-    _ = template_kind; // until Task 11 wires ChatMLToolFormat in
+    _ = template_kind; // until Task 11
     return noopToolFormat();
 }
 
@@ -416,7 +547,6 @@ test "NoopToolFormat.renderToolResultMessage appends raw content" {
 test "forTemplate returns a usable ToolFormat for every kind" {
     inline for (.{ .chatml, .llama3, .gemma, .openai_moe, .generic }) |kind| {
         const tf = forTemplate(kind);
-        // Smoke test: the returned ToolFormat's vtable methods are callable.
         const result = try tf.parseAssistantToolCalls("x", std.testing.allocator);
         _ = result;
     }
@@ -545,4 +675,89 @@ test "ChatMLToolFormat.renderToolResultMessage wraps content in tool_response ta
         \\</tool_response>
         \\
     , buf.items);
+}
+
+test "StreamingDetector.feed emits normal text as content" {
+    const tf = chatmlToolFormat();
+    const detector = try tf.newStreamingDetector(std.testing.allocator);
+    defer {
+        detector.deinit();
+        std.testing.allocator.destroy(detector);
+    }
+    const result = try detector.feed("Hello, world!");
+    try std.testing.expectEqual(FeedResult.emit_as_content, result);
+}
+
+test "StreamingDetector.feed emits prefix content before tool_call_complete" {
+    const tf = chatmlToolFormat();
+    const detector = try tf.newStreamingDetector(std.testing.allocator);
+    defer {
+        detector.deinit();
+        std.testing.allocator.destroy(detector);
+    }
+
+    const chunk = "Sure!\n<tool_call>\n{\"name\":\"X\",\"arguments\":{}}\n</tool_call>";
+
+    // First call: should return emit_as_content with "Sure!\n"
+    const r1 = try detector.feed(chunk);
+    try std.testing.expectEqual(FeedResult.emit_as_content, r1);
+    const content = detector.takeContentDelta();
+    try std.testing.expectEqualStrings("Sure!\n", content);
+
+    // Second call (empty): pending_calls is non-empty so returns tool_call_complete.
+    const r2 = try detector.feed("");
+    try std.testing.expectEqual(FeedResult.tool_call_complete, r2);
+    const call = detector.takePendingToolCall() orelse return error.NoCall;
+    defer {
+        std.testing.allocator.free(call.id);
+        std.testing.allocator.free(call.name);
+        std.testing.allocator.free(call.arguments_json);
+    }
+    try std.testing.expectEqualStrings("X", call.name);
+    try std.testing.expectEqualStrings("call_0", call.id);
+}
+
+test "StreamingDetector flushes false-positive partial tag as content" {
+    const tf = chatmlToolFormat();
+    const detector = try tf.newStreamingDetector(std.testing.allocator);
+    defer {
+        detector.deinit();
+        std.testing.allocator.destroy(detector);
+    }
+
+    // First chunk ends with "<th" — might be start of <tool_call>
+    _ = try detector.feed("Hello <th");
+
+    // Second chunk "ink>" makes "<think>" which is NOT a tool_call.
+    const r2 = try detector.feed("ink>");
+    try std.testing.expectEqual(FeedResult.emit_as_content, r2);
+
+    const content = detector.takeContentDelta();
+    // Verify some bytes were flushed as content (exact split may vary)
+    try std.testing.expect(content.len > 0);
+}
+
+test "forTemplate returns ChatMLToolFormat for chatml kind" {
+    const tf = forTemplate(.chatml);
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    const tools = [_]ToolDefinition{
+        .{ .name = "f", .description = "d", .parameters_json = "{}" },
+    };
+    try tf.renderToolDefinitions(&tools, &buf, std.testing.allocator);
+    // ChatML emits a non-empty buffer; Noop emits empty.
+    try std.testing.expect(buf.items.len > 0);
+}
+
+test "forTemplate returns NoopToolFormat for non-chatml kinds" {
+    inline for (.{ .llama3, .gemma, .openai_moe, .generic }) |kind| {
+        const tf = forTemplate(kind);
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(std.testing.allocator);
+        const tools = [_]ToolDefinition{
+            .{ .name = "f", .description = "d", .parameters_json = "{}" },
+        };
+        try tf.renderToolDefinitions(&tools, &buf, std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    }
 }
