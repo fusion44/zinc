@@ -473,37 +473,49 @@ pub fn load(
     }
 
     var total_vram: u64 = 0;
+    var total_host_visible: u64 = 0;
     for (gf.tensors.items) |tensor_info| {
         const tensor_size = tensor_info.sizeBytes();
         const data_offset = gf.tensor_data_offset + tensor_info.offset;
+        const src_data = mmap_data[data_offset..][0..@intCast(tensor_size)];
+        const offload = shouldOffloadToHost(tensor_info.name);
 
-        // Create device-local buffer
-        var gpu_buf = try Buffer.initDeviceLocal(
-            instance,
-            tensor_size,
-            vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        );
+        var gpu_buf = blk: {
+            if (offload) {
+                break :blk try Buffer.initHostVisibleStorage(instance, tensor_size);
+            } else {
+                break :blk try Buffer.initDeviceLocal(
+                    instance,
+                    tensor_size,
+                    vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                );
+            }
+        };
         errdefer gpu_buf.deinit();
 
-        // Stage and copy data to GPU
-        const src_data = mmap_data[data_offset..][0..@intCast(tensor_size)];
-        var staging = try Buffer.initStaging(instance, tensor_size);
-        defer staging.deinit();
-
-        staging.upload(src_data);
-        try buffer_mod.copyBuffer(instance, cmd_pool.handle, &staging, &gpu_buf, tensor_size);
+        if (offload) {
+            // Host-visible: GPU reads directly over PCIe; memcpy from mmap, no staging.
+            gpu_buf.upload(src_data);
+            total_host_visible += tensor_size;
+        } else {
+            // Device-local: stage in host memory, then GPU-side copy into VRAM.
+            var staging = try Buffer.initStaging(instance, tensor_size);
+            defer staging.deinit();
+            staging.upload(src_data);
+            try buffer_mod.copyBuffer(instance, cmd_pool.handle, &staging, &gpu_buf, tensor_size);
+            total_vram += tensor_size;
+        }
 
         try loaded_tensors.append(allocator, .{
             .info = tensor_info,
             .gpu_buffer = gpu_buf,
         });
-
-        total_vram += tensor_size;
     }
 
-    log.info("Loaded {d} tensors | {d} MB VRAM", .{
+    log.info("Loaded {d} tensors | {d} MB device-local VRAM | {d} MB host-visible (system RAM)", .{
         loaded_tensors.items.len,
         total_vram / (1024 * 1024),
+        total_host_visible / (1024 * 1024),
     });
 
     return Model{
