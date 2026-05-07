@@ -2004,7 +2004,7 @@ test "encodeWithSpecialTokens handles consecutive special tokens" {
 }
 
 test "applyChatTemplateWithOptions chatml renders tool definitions in system message" {
-    const tool_format_mod_t = @import("server/tool_format.zig");
+    const tool_format_mod_t = @import("../server/tool_format.zig");
     var tok = Tokenizer{
         .vocab = &.{},
         .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
@@ -2042,7 +2042,7 @@ test "applyChatTemplateWithOptions chatml renders tool definitions in system mes
 }
 
 test "applyChatTemplateWithOptions chatml renders tool result messages aggregated in user turn" {
-    const tool_format_mod_t = @import("server/tool_format.zig");
+    const tool_format_mod_t = @import("../server/tool_format.zig");
     var tok = Tokenizer{
         .vocab = &.{},
         .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
