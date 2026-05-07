@@ -186,6 +186,204 @@ pub fn forTemplate(template_kind: TemplateKind) ToolFormat {
 }
 
 // ============================================================
+// ChatMLToolFormat — Qwen3-family tool calling.
+// ============================================================
+
+const tool_call_open = "<tool_call>";
+const tool_call_close = "</tool_call>";
+
+fn chatml_render_defs(
+    _: *anyopaque,
+    tools: []const ToolDefinition,
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) !void {
+    if (tools.len == 0) return;
+
+    // Verbatim from Qwen3.5's published chat_template.
+    try buf.appendSlice(allocator,
+        \\
+        \\# Tools
+        \\
+        \\You may call one or more functions to assist with the user query.
+        \\
+        \\You are provided with function signatures within <tools></tools> XML tags:
+        \\<tools>
+        \\
+    );
+
+    for (tools) |tool| {
+        try buf.appendSlice(allocator, "{\"type\": \"function\", \"function\": {\"name\": \"");
+        try buf.appendSlice(allocator, tool.name);
+        try buf.appendSlice(allocator, "\", \"description\": \"");
+        try buf.appendSlice(allocator, tool.description);
+        try buf.appendSlice(allocator, "\", \"parameters\": ");
+        try buf.appendSlice(allocator, tool.parameters_json);
+        try buf.appendSlice(allocator, "}}\n");
+    }
+
+    try buf.appendSlice(allocator,
+        \\</tools>
+        \\
+        \\For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+        \\<tool_call>
+        \\{"name": <function-name>, "arguments": <args-json-object>}
+        \\</tool_call>
+    );
+}
+
+fn chatml_render_result(
+    _: *anyopaque,
+    tool_call_id: []const u8,
+    content: []const u8,
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) !void {
+    _ = tool_call_id; // Qwen3 doesn't render the call id
+    try buf.appendSlice(allocator, "<tool_response>\n");
+    try buf.appendSlice(allocator, content);
+    if (content.len == 0 or content[content.len - 1] != '\n') {
+        try buf.appendSlice(allocator, "\n");
+    }
+    try buf.appendSlice(allocator, "</tool_response>\n");
+}
+
+fn chatml_fallback_block(
+    text_buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    inner: []const u8,
+) !void {
+    try text_buf.appendSlice(allocator, tool_call_open);
+    try text_buf.appendSlice(allocator, "\n");
+    try text_buf.appendSlice(allocator, inner);
+    try text_buf.appendSlice(allocator, "\n");
+    try text_buf.appendSlice(allocator, tool_call_close);
+}
+
+fn chatml_parse_calls(
+    _: *anyopaque,
+    model_output: []const u8,
+    allocator: std.mem.Allocator,
+) !ParsedAssistantOutput {
+    var calls: std.ArrayList(ToolCall) = .{};
+    errdefer {
+        for (calls.items) |c| {
+            allocator.free(c.id);
+            allocator.free(c.name);
+            allocator.free(c.arguments_json);
+        }
+        calls.deinit(allocator);
+    }
+    var text_buf: std.ArrayList(u8) = .{};
+    errdefer text_buf.deinit(allocator);
+
+    var search_from: usize = 0;
+    var next_id: u32 = 0;
+
+    while (std.mem.indexOfPos(u8, model_output, search_from, tool_call_open)) |open_at| {
+        // Append text between search_from and open_at to text_buf.
+        try text_buf.appendSlice(allocator, model_output[search_from..open_at]);
+
+        const after_open = open_at + tool_call_open.len;
+        const close_at = std.mem.indexOfPos(u8, model_output, after_open, tool_call_close) orelse {
+            // Unclosed tool_call: leave open tag and rest of input in text_buf.
+            try text_buf.appendSlice(allocator, model_output[open_at..]);
+            search_from = model_output.len;
+            break;
+        };
+
+        const inner = std.mem.trim(u8, model_output[after_open..close_at], " \t\r\n");
+
+        // Parse the inner JSON using std.json.parseFromSlice with a dynamic Value.
+        const parsed_result = std.json.parseFromSlice(std.json.Value, allocator, inner, .{}) catch {
+            // Malformed JSON: include the entire block (tags + content) in text_buf.
+            try chatml_fallback_block(&text_buf, allocator, inner);
+            search_from = close_at + tool_call_close.len;
+            continue;
+        };
+        defer parsed_result.deinit();
+
+        // Extract "name" and "arguments" fields.
+        const obj = switch (parsed_result.value) {
+            .object => |o| o,
+            else => {
+                try chatml_fallback_block(&text_buf, allocator, inner);
+                search_from = close_at + tool_call_close.len;
+                continue;
+            },
+        };
+
+        const name_val = obj.get("name") orelse {
+            try chatml_fallback_block(&text_buf, allocator, inner);
+            search_from = close_at + tool_call_close.len;
+            continue;
+        };
+        const name_str = switch (name_val) {
+            .string => |s| s,
+            else => {
+                try chatml_fallback_block(&text_buf, allocator, inner);
+                search_from = close_at + tool_call_close.len;
+                continue;
+            },
+        };
+
+        // Re-serialize the arguments JSON using valueAlloc.
+        const empty_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+        const args_val = obj.get("arguments") orelse empty_obj;
+        const args_json = try std.json.Stringify.valueAlloc(allocator, args_val, .{});
+        errdefer allocator.free(args_json);
+
+        // Build the id string.
+        const id_str = try std.fmt.allocPrint(allocator, "call_{d}", .{next_id});
+        next_id += 1;
+        errdefer allocator.free(id_str);
+
+        const name_owned = try allocator.dupe(u8, name_str);
+        errdefer allocator.free(name_owned);
+
+        try calls.append(allocator, .{
+            .id = id_str,
+            .name = name_owned,
+            .arguments_json = args_json,
+        });
+
+        search_from = close_at + tool_call_close.len;
+    }
+
+    // Append any tail after the last tool_call.
+    if (search_from < model_output.len) {
+        try text_buf.appendSlice(allocator, model_output[search_from..]);
+    }
+
+    return .{
+        .text_content = try text_buf.toOwnedSlice(allocator),
+        .tool_calls = try calls.toOwnedSlice(allocator),
+    };
+}
+
+fn chatml_new_detector(_: *anyopaque, allocator: std.mem.Allocator) !*StreamingDetector {
+    const d = try allocator.create(StreamingDetector);
+    d.* = .{ .allocator = allocator };
+    return d;
+}
+
+const vtable_chatml = ToolFormat.VTable{
+    .renderToolDefinitions = chatml_render_defs,
+    .renderToolResultMessage = chatml_render_result,
+    .parseAssistantToolCalls = chatml_parse_calls,
+    .newStreamingDetector = chatml_new_detector,
+};
+
+var chatml_instance: u8 = 0;
+
+pub fn chatmlToolFormat() ToolFormat {
+    return .{
+        .ptr = @ptrCast(&chatml_instance),
+        .vtable = &vtable_chatml,
+    };
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -222,4 +420,129 @@ test "forTemplate returns a usable ToolFormat for every kind" {
         const result = try tf.parseAssistantToolCalls("x", std.testing.allocator);
         _ = result;
     }
+}
+
+test "ChatMLToolFormat.parseAssistantToolCalls extracts a single tool call" {
+    const tf = chatmlToolFormat();
+    const output =
+        \\Let me check that.
+        \\<tool_call>
+        \\{"name": "Bash", "arguments": {"command": "ls /"}}
+        \\</tool_call>
+    ;
+    const parsed = try tf.parseAssistantToolCalls(output, std.testing.allocator);
+    defer {
+        for (parsed.tool_calls) |c| {
+            std.testing.allocator.free(c.id);
+            std.testing.allocator.free(c.name);
+            std.testing.allocator.free(c.arguments_json);
+        }
+        std.testing.allocator.free(parsed.tool_calls);
+        std.testing.allocator.free(parsed.text_content);
+    }
+
+    try std.testing.expectEqualStrings("Let me check that.\n", parsed.text_content);
+    try std.testing.expectEqual(@as(usize, 1), parsed.tool_calls.len);
+    try std.testing.expectEqualStrings("call_0", parsed.tool_calls[0].id);
+    try std.testing.expectEqualStrings("Bash", parsed.tool_calls[0].name);
+    try std.testing.expectEqualStrings(
+        \\{"command": "ls /"}
+    , parsed.tool_calls[0].arguments_json);
+}
+
+test "ChatMLToolFormat.parseAssistantToolCalls extracts multiple parallel calls" {
+    const tf = chatmlToolFormat();
+    const output =
+        \\Let me run two commands.
+        \\<tool_call>
+        \\{"name": "Bash", "arguments": {"command": "ls /"}}
+        \\</tool_call>
+        \\<tool_call>
+        \\{"name": "Read", "arguments": {"path": "/etc/hostname"}}
+        \\</tool_call>
+    ;
+    const parsed = try tf.parseAssistantToolCalls(output, std.testing.allocator);
+    defer {
+        for (parsed.tool_calls) |c| {
+            std.testing.allocator.free(c.id);
+            std.testing.allocator.free(c.name);
+            std.testing.allocator.free(c.arguments_json);
+        }
+        std.testing.allocator.free(parsed.tool_calls);
+        std.testing.allocator.free(parsed.text_content);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.tool_calls.len);
+    try std.testing.expectEqualStrings("call_0", parsed.tool_calls[0].id);
+    try std.testing.expectEqualStrings("Bash", parsed.tool_calls[0].name);
+    try std.testing.expectEqualStrings("call_1", parsed.tool_calls[1].id);
+    try std.testing.expectEqualStrings("Read", parsed.tool_calls[1].name);
+    try std.testing.expectEqualStrings("Let me run two commands.\n", parsed.text_content);
+}
+
+test "ChatMLToolFormat.parseAssistantToolCalls falls back to text on malformed JSON" {
+    const tf = chatmlToolFormat();
+    const output =
+        \\Let me try.
+        \\<tool_call>
+        \\{not valid json}
+        \\</tool_call>
+        \\<tool_call>
+        \\{"name": "OK", "arguments": {}}
+        \\</tool_call>
+    ;
+    const parsed = try tf.parseAssistantToolCalls(output, std.testing.allocator);
+    defer {
+        for (parsed.tool_calls) |c| {
+            std.testing.allocator.free(c.id);
+            std.testing.allocator.free(c.name);
+            std.testing.allocator.free(c.arguments_json);
+        }
+        std.testing.allocator.free(parsed.tool_calls);
+        std.testing.allocator.free(parsed.text_content);
+    }
+
+    // The valid call still extracted; id is "call_0" since malformed didn't get an id.
+    try std.testing.expectEqual(@as(usize, 1), parsed.tool_calls.len);
+    try std.testing.expectEqualStrings("call_0", parsed.tool_calls[0].id);
+    try std.testing.expectEqualStrings("OK", parsed.tool_calls[0].name);
+    // The malformed block (with tags) appears in text_content.
+    try std.testing.expect(std.mem.indexOf(u8, parsed.text_content, "<tool_call>\n{not valid json}\n</tool_call>") != null);
+}
+
+test "ChatMLToolFormat.renderToolDefinitions emits Qwen3 verbatim tool prompt" {
+    const tf = chatmlToolFormat();
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    const tools = [_]ToolDefinition{
+        .{
+            .name = "Bash",
+            .description = "Execute a bash command.",
+            .parameters_json =
+            \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+            ,
+        },
+    };
+    try tf.renderToolDefinitions(&tools, &buf, std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "# Tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "<tools>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "</tools>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"name\": \"Bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"description\": \"Execute a bash command.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "<tool_call>") != null);
+}
+
+test "ChatMLToolFormat.renderToolResultMessage wraps content in tool_response tags" {
+    const tf = chatmlToolFormat();
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    try tf.renderToolResultMessage("call_0", "exit code 0\nfile: hello.txt\n", &buf, std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        \\<tool_response>
+        \\exit code 0
+        \\file: hello.txt
+        \\</tool_response>
+        \\
+    , buf.items);
 }
