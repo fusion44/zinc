@@ -134,6 +134,34 @@ pub const Buffer = struct {
         return buf;
     }
 
+    /// Create a host-visible storage buffer that the GPU reads in place via PCIe.
+    /// @param instance Active Vulkan instance and logical device.
+    /// @param size Buffer size in bytes.
+    /// @returns A storage buffer ready for direct CPU writes through `mapped`.
+    /// @note Memory is allocated as `HOST_VISIBLE | HOST_COHERENT`, so the GPU reads
+    /// it over PCIe BAR rather than from device-local VRAM. Used to offload large
+    /// rarely-touched tensors (MoE expert weights) when device memory is insufficient.
+    /// Coherent memory means no explicit invalidate is needed; we only write at load time.
+    pub fn initHostVisibleStorage(instance: *const Instance, size: vk.c.VkDeviceSize) !Buffer {
+        var buf = try init(
+            instance,
+            size,
+            vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            vk.c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        );
+
+        var ptr: ?*anyopaque = null;
+        const result = vk.c.vkMapMemory(instance.device, buf.memory, 0, size, 0, &ptr);
+        if (result != vk.c.VK_SUCCESS) {
+            log.err("vkMapMemory failed: {d}", .{result});
+            buf.deinit();
+            return error.MapMemoryFailed;
+        }
+        buf.mapped = @ptrCast(ptr);
+
+        return buf;
+    }
+
     /// Copy raw bytes into a previously mapped staging buffer.
     /// @param self Mapped staging buffer to write into.
     /// @param data Bytes to copy from the CPU into the mapped range.
