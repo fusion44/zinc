@@ -4,6 +4,7 @@
 //! embedded in GGUF model files, eliminating external tokenizer dependencies.
 const std = @import("std");
 const gguf = @import("gguf.zig");
+const tool_format_mod = @import("../server/tool_format.zig");
 
 const log = std.log.scoped(.tokenizer);
 
@@ -847,6 +848,10 @@ pub const Tokenizer = struct {
         add_generation_prompt: bool = true,
         /// When true, skip the thinking template entirely even if the tokenizer supports it.
         skip_thinking_template: bool = false,
+        /// Tool definitions to render into the system message. Empty slice = no tools.
+        tools: []const tool_format_mod.ToolDefinition = &.{},
+        /// The format renderer to use for tool definitions and tool result messages.
+        tool_format: ?tool_format_mod.ToolFormat = null,
     };
 
     fn appendTrimmed(dst: []u8, pos: *usize, text: []const u8) !void {
@@ -905,9 +910,66 @@ pub const Tokenizer = struct {
         const n = @min(roles.len, contents.len);
         switch (template_kind) {
             .chatml => {
-                for (0..n) |i| {
-                    const written = std.fmt.bufPrint(buf[pos..], "<|im_start|>{s}\n{s}<|im_end|>\n", .{ roles[i], contents[i] }) catch return error.BufferTooSmall;
-                    pos += written.len;
+                var tools_rendered = false;
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    const is_tool = std.mem.eql(u8, roles[i], "tool");
+
+                    if (is_tool and options.tool_format != null) {
+                        // Aggregate consecutive tool results into a single user turn.
+                        const prev_was_tool = i > 0 and std.mem.eql(u8, roles[i - 1], "tool");
+                        if (!prev_was_tool) {
+                            const open = std.fmt.bufPrint(buf[pos..], "<|im_start|>user\n", .{}) catch return error.BufferTooSmall;
+                            pos += open.len;
+                        }
+
+                        var trbuf = std.ArrayList(u8).init(std.heap.page_allocator);
+                        defer trbuf.deinit();
+                        try options.tool_format.?.renderToolResultMessage("", contents[i], &trbuf, std.heap.page_allocator);
+                        if (pos + trbuf.items.len > buf.len) return error.BufferTooSmall;
+                        @memcpy(buf[pos .. pos + trbuf.items.len], trbuf.items);
+                        pos += trbuf.items.len;
+
+                        // Close user turn only when next message is not also a tool.
+                        const next_is_tool = (i + 1 < n) and std.mem.eql(u8, roles[i + 1], "tool");
+                        if (!next_is_tool) {
+                            const close = std.fmt.bufPrint(buf[pos..], "<|im_end|>\n", .{}) catch return error.BufferTooSmall;
+                            pos += close.len;
+                        }
+                        continue;
+                    }
+
+                    const header = std.fmt.bufPrint(buf[pos..], "<|im_start|>{s}\n{s}", .{ roles[i], contents[i] }) catch return error.BufferTooSmall;
+                    pos += header.len;
+
+                    // Inject tool definitions into the first system/developer message.
+                    if (!tools_rendered and options.tools.len > 0 and options.tool_format != null and
+                        (std.mem.eql(u8, roles[i], "system") or std.mem.eql(u8, roles[i], "developer")))
+                    {
+                        var tool_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+                        defer tool_buf.deinit();
+                        try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, std.heap.page_allocator);
+                        if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
+                        @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
+                        pos += tool_buf.items.len;
+                        tools_rendered = true;
+                    }
+
+                    const close = std.fmt.bufPrint(buf[pos..], "<|im_end|>\n", .{}) catch return error.BufferTooSmall;
+                    pos += close.len;
+                }
+                // If no system message but tools provided, add a synthetic system turn.
+                if (!tools_rendered and options.tools.len > 0 and options.tool_format != null) {
+                    const open = std.fmt.bufPrint(buf[pos..], "<|im_start|>system", .{}) catch return error.BufferTooSmall;
+                    pos += open.len;
+                    var tool_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+                    defer tool_buf.deinit();
+                    try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, std.heap.page_allocator);
+                    if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
+                    @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
+                    pos += tool_buf.items.len;
+                    const close = std.fmt.bufPrint(buf[pos..], "<|im_end|>\n", .{}) catch return error.BufferTooSmall;
+                    pos += close.len;
                 }
                 if (options.add_generation_prompt) {
                     const suffix = if (supports_thinking and !options.skip_thinking_template) blk: {
@@ -1939,4 +2001,81 @@ test "encodeWithSpecialTokens handles consecutive special tokens" {
     defer std.testing.allocator.free(tokens);
 
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, tokens);
+}
+
+test "applyChatTemplateWithOptions chatml renders tool definitions in system message" {
+    const tool_format_mod_t = @import("server/tool_format.zig");
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 2,
+        .prepend_bos = false,
+        .chat_template = null, // null → chatml
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+
+    const tools = [_]tool_format_mod_t.ToolDefinition{.{
+        .name = "get_weather",
+        .description = "Get the weather",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{}}",
+    }};
+
+    const roles = [_][]const u8{ "system", "user" };
+    const contents = [_][]const u8{ "You are helpful.", "What's the weather?" };
+    var buf: [4096]u8 = undefined;
+    const result = try tok.applyChatTemplateWithOptions(&roles, &contents, .{
+        .add_generation_prompt = false,
+        .tools = &tools,
+        .tool_format = tool_format_mod_t.chatmlToolFormat(),
+    }, &buf);
+
+    // System message should contain the tool definitions header.
+    try std.testing.expect(std.mem.indexOf(u8, result, "# Tools") != null);
+    // The system close tag must come after the tool block.
+    const tools_pos = std.mem.indexOf(u8, result, "# Tools").?;
+    const end_pos = std.mem.indexOfPos(u8, result, tools_pos, "<|im_end|>").?;
+    try std.testing.expect(end_pos > tools_pos);
+}
+
+test "applyChatTemplateWithOptions chatml renders tool result messages aggregated in user turn" {
+    const tool_format_mod_t = @import("server/tool_format.zig");
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 2,
+        .prepend_bos = false,
+        .chat_template = null,
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{ "user", "assistant", "tool", "tool" };
+    const contents = [_][]const u8{ "Call weather.", "Sure!", "sunny", "warm" };
+    var buf: [4096]u8 = undefined;
+    const result = try tok.applyChatTemplateWithOptions(&roles, &contents, .{
+        .add_generation_prompt = false,
+        .tool_format = tool_format_mod_t.chatmlToolFormat(),
+    }, &buf);
+
+    // Both tool results should appear inside a single <|im_start|>user turn.
+    try std.testing.expect(std.mem.indexOf(u8, result, "<tool_response>") != null);
+    // "sunny" and "warm" should both be present.
+    try std.testing.expect(std.mem.indexOf(u8, result, "sunny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "warm") != null);
+    // Only one <|im_start|>user from the tool aggregation (plus the first user turn).
+    // Consecutive tool messages should produce exactly one extra user start.
+    var user_turn_count: usize = 0;
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, result, search_pos, "<|im_start|>user")) |p| {
+        user_turn_count += 1;
+        search_pos = p + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), user_turn_count);
 }
