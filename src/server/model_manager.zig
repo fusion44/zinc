@@ -468,8 +468,12 @@ fn loadResourcesInto(
 }
 
 fn tensorBytes(model: *const loader_mod.Model) u64 {
+    // Only count device-local tensors against the VRAM budget. MoE expert
+    // tensors offloaded to host-visible memory live in system RAM and do
+    // not consume VRAM. See loader.shouldOffloadToHost for the rule.
     var total: u64 = 0;
     for (model.gguf_file.tensors.items) |tensor_info| {
+        if (loader_mod.shouldOffloadToHost(tensor_info.name)) continue;
         total += tensor_info.sizeBytes();
     }
     return total;
