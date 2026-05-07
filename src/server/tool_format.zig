@@ -312,8 +312,10 @@ pub fn noopToolFormat() ToolFormat {
 // ============================================================
 
 pub fn forTemplate(template_kind: TemplateKind) ToolFormat {
-    _ = template_kind; // until Task 11
-    return noopToolFormat();
+    return switch (template_kind) {
+        .chatml => chatmlToolFormat(),
+        else => noopToolFormat(),
+    };
 }
 
 // ============================================================
@@ -548,7 +550,10 @@ test "forTemplate returns a usable ToolFormat for every kind" {
     inline for (.{ .chatml, .llama3, .gemma, .openai_moe, .generic }) |kind| {
         const tf = forTemplate(kind);
         const result = try tf.parseAssistantToolCalls("x", std.testing.allocator);
-        _ = result;
+        if (kind == .chatml) {
+            std.testing.allocator.free(result.text_content);
+            std.testing.allocator.free(result.tool_calls);
+        }
     }
 }
 
