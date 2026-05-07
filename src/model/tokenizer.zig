@@ -1014,7 +1014,7 @@ pub const Tokenizer = struct {
         return buf[0..pos];
     }
 
-    const TemplateKind = enum { chatml, llama3, gemma, openai_moe, generic };
+    pub const TemplateKind = enum { chatml, llama3, gemma, openai_moe, generic };
 
     /// Return the detected chat template kind as a human-readable string (e.g. "chatml", "openai_moe").
     pub fn detectTemplateKindName(self: *const Tokenizer) []const u8 {

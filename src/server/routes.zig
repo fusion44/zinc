@@ -12,6 +12,7 @@ const model_manager_mod = runtime.model_manager_mod;
 const tokenizer_mod = runtime.tokenizer_mod;
 const Model = runtime.Model;
 const memory_plan = @import("../gpu/memory_plan.zig");
+const tool_format = @import("tool_format.zig");
 
 const log = std.log.scoped(.routes);
 
