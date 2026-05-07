@@ -918,13 +918,20 @@ fn countValidChatMessages(messages: []const ChatMessage) usize {
     return count;
 }
 
-fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const u8, thinking_enabled: bool) usize {
+fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const u8, thinking_enabled: bool, tools: []const tool_format.ToolDefinition) usize {
     var total: usize = 128;
     const n = @min(roles.len, contents.len);
     for (0..n) |i| {
         total += roles[i].len + contents[i].len + 32;
     }
     if (thinking_enabled) total += thinking_prefix.len + 32 else total += 32;
+    // Add budget for injected tool definitions: ~400 byte Qwen3 header + ~256 bytes per tool.
+    if (tools.len > 0) {
+        total += 512;
+        for (tools) |t| {
+            total += t.name.len + t.description.len + t.parameters_json.len + 64;
+        }
+    }
     return total;
 }
 
@@ -982,7 +989,7 @@ fn warmChatReuseCache(
     transcript_roles[roles.len] = "assistant";
     transcript_contents[contents.len] = assistant_content;
 
-    const transcript_capacity = estimateChatPromptBytes(transcript_roles, transcript_contents, false) + assistant_content.len + 64;
+    const transcript_capacity = estimateChatPromptBytes(transcript_roles, transcript_contents, false, &.{}) + assistant_content.len + 64;
     const transcript_buf = try allocator.alloc(u8, transcript_capacity);
     defer allocator.free(transcript_buf);
     const transcript_prompt = try buildChatTranscriptPrompt(tokenizer, transcript_roles, transcript_contents, thinking_enabled, transcript_buf);
@@ -1778,7 +1785,7 @@ fn handleChatCompletions(
     }
     defer runtime.setLogitsReadbackEnabled(engine, previous_logits_readback);
 
-    const prompt_capacity = estimateChatPromptBytes(parsed.roles, parsed.contents, supportsEnabledThinking(tokenizer, parsed.enable_thinking));
+    const prompt_capacity = estimateChatPromptBytes(parsed.roles, parsed.contents, supportsEnabledThinking(tokenizer, parsed.enable_thinking), parsed.tools);
     const prompt_buf = allocator.alloc(u8, prompt_capacity) catch {
         try conn.sendError(500, "internal_error", "Prompt allocation failed");
         return;
@@ -2221,20 +2228,20 @@ fn handleChatCompletions(
 
         if (parsed_output.tool_calls.len > 0) {
             // Emit response with tool_calls, content null
-            var wb = std.ArrayList(u8).init(allocator);
-            defer wb.deinit();
-            try wb.writer().print(
+            var wb: std.ArrayList(u8) = .{};
+            defer wb.deinit(allocator);
+            try wb.writer(allocator).print(
                 \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":[
             , .{ req_id, ts, model_name });
             for (parsed_output.tool_calls, 0..) |tc, ti| {
-                if (ti > 0) try wb.appendSlice(",");
+                if (ti > 0) try wb.appendSlice(allocator, ",");
                 var args_esc_buf: [16384]u8 = undefined;
                 const args_esc = jsonEscape(tc.arguments_json, &args_esc_buf);
-                try wb.writer().print(
+                try wb.writer(allocator).print(
                     \\{{"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
                 , .{ tc.id, tc.name, args_esc });
             }
-            try wb.writer().print(
+            try wb.writer(allocator).print(
                 \\]}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{ @tagName(finish_reason), prompt_tokens.len, ns_gen, prompt_tokens.len + ns_gen });
             try conn.sendJson(200, wb.items);
