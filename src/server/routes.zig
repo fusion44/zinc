@@ -777,9 +777,61 @@ fn completionFinishReason(requested_max_tokens: u32, effective_max_tokens: u32, 
     return .stop;
 }
 
+/// One block inside an OpenAI-style content array, e.g. `{type: "text", text: "..."}`.
+/// Unknown block types (image_url, tool_use, etc.) are accepted but ignored downstream.
+const ContentBlock = struct {
+    type: []const u8 = "",
+    text: []const u8 = "",
+};
+
+/// Message content. OpenAI-compatible clients send three shapes:
+///   1. plain string             — `"hello"`
+///   2. content-block array      — `[{"type":"text","text":"hello"}]`
+///   3. null (assistant tool call) — `null`
+/// We flatten all three to a single string. Non-text blocks are skipped silently.
+const Content = struct {
+    text: []const u8 = "",
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !Content {
+        switch (try source.peekNextTokenType()) {
+            .null => {
+                _ = try source.next();
+                return .{ .text = "" };
+            },
+            .string => {
+                const s = try std.json.innerParse([]const u8, allocator, source, options);
+                return .{ .text = s };
+            },
+            .array_begin => {
+                _ = try source.next();
+                var pieces: std.ArrayList([]const u8) = .{};
+                defer pieces.deinit(allocator);
+                while (true) {
+                    if ((try source.peekNextTokenType()) == .array_end) {
+                        _ = try source.next();
+                        break;
+                    }
+                    const block = try std.json.innerParse(ContentBlock, allocator, source, options);
+                    if (std.mem.eql(u8, block.type, "text") and block.text.len > 0) {
+                        try pieces.append(allocator, block.text);
+                    }
+                }
+                if (pieces.items.len == 0) return .{ .text = "" };
+                if (pieces.items.len == 1) return .{ .text = pieces.items[0] };
+                return .{ .text = try std.mem.concat(allocator, u8, pieces.items) };
+            },
+            else => return error.UnexpectedToken,
+        }
+    }
+};
+
 const ChatMessage = struct {
     role: []const u8 = "",
-    content: []const u8 = "",
+    content: Content = .{},
 };
 
 const ChatRequestBody = struct {
@@ -813,7 +865,7 @@ const ParsedChatRequest = struct {
 fn countValidChatMessages(messages: []const ChatMessage) usize {
     var count: usize = 0;
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.len == 0) continue;
+        if (message.role.len == 0 or message.content.text.len == 0) continue;
         count += 1;
     }
     return count;
@@ -962,7 +1014,7 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     var count: usize = 0;
     var has_guiding_message = false;
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.len == 0) continue;
+        if (message.role.len == 0 or message.content.text.len == 0) continue;
         if (std.mem.eql(u8, message.role, "system") or std.mem.eql(u8, message.role, "developer")) {
             has_guiding_message = true;
         }
@@ -980,12 +1032,12 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     }
 
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.len == 0) continue;
+        if (message.role.len == 0 or message.content.text.len == 0) continue;
         roles[count] = message.role;
         contents[count] = if (std.mem.eql(u8, message.role, "assistant"))
-            sanitizeAssistantHistoryContent(message.content)
+            sanitizeAssistantHistoryContent(message.content.text)
         else
-            message.content;
+            message.content.text;
         count += 1;
     }
 
@@ -3046,9 +3098,9 @@ test "parseChatRequest defaults to greedy temperature when omitted" {
 
 test "countValidChatMessages ignores empty entries" {
     const messages = [_]ChatMessage{
-        .{ .role = "", .content = "ignored" },
-        .{ .role = "user", .content = "" },
-        .{ .role = "user", .content = "hello" },
+        .{ .role = "", .content = .{ .text = "ignored" } },
+        .{ .role = "user", .content = .{ .text = "" } },
+        .{ .role = "user", .content = .{ .text = "hello" } },
     };
     try std.testing.expectEqual(@as(usize, 1), countValidChatMessages(&messages));
 }
@@ -3061,6 +3113,60 @@ test "parseChatRequest leaves empty message array empty before validation" {
     try std.testing.expectEqual(@as(usize, 0), countValidChatMessages(parsed.parsed.value.messages));
     try std.testing.expectEqual(@as(usize, 1), parsed.roles.len);
     try std.testing.expectEqualStrings("system", parsed.roles[0]);
+}
+
+test "parseChatRequest accepts content as a single text block array (OpenAI multimodal shape)" {
+    const body =
+        \\{"messages":[{"role":"user","content":[{"type":"text","text":"hello world"}]}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    // system prompt + user message
+    try std.testing.expectEqual(@as(usize, 2), parsed.roles.len);
+    try std.testing.expectEqualStrings("user", parsed.roles[1]);
+    try std.testing.expectEqualStrings("hello world", parsed.contents[1]);
+}
+
+test "parseChatRequest concatenates multiple text blocks in order" {
+    const body =
+        \\{"messages":[{"role":"user","content":[{"type":"text","text":"first "},{"type":"text","text":"second"}]}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("user", parsed.roles[1]);
+    try std.testing.expectEqualStrings("first second", parsed.contents[1]);
+}
+
+test "parseChatRequest skips non-text blocks without failing" {
+    // image_url and unknown block types should be silently dropped, not error.
+    const body =
+        \\{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x"}},{"type":"text","text":"caption"}]}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("caption", parsed.contents[1]);
+}
+
+test "parseChatRequest accepts null content (assistant tool-call message)" {
+    // Assistant turn that only invokes a tool has content: null. We don't
+    // yet act on tool_calls, but the request must parse and the empty
+    // assistant message must be skipped, not abort the whole request.
+    const body =
+        \\{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"user","content":"follow up"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    // system + user + (assistant skipped: empty content) + user
+    try std.testing.expectEqual(@as(usize, 3), parsed.roles.len);
+    try std.testing.expectEqualStrings("system", parsed.roles[0]);
+    try std.testing.expectEqualStrings("user", parsed.roles[1]);
+    try std.testing.expectEqualStrings("q", parsed.contents[1]);
+    try std.testing.expectEqualStrings("user", parsed.roles[2]);
+    try std.testing.expectEqualStrings("follow up", parsed.contents[2]);
 }
 
 test "prefixThinkingEnvelope adds think prefix when enabled" {
