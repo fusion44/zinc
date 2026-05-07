@@ -923,8 +923,8 @@ pub const Tokenizer = struct {
                             pos += open.len;
                         }
 
-                        var trbuf = std.ArrayList(u8).init(std.heap.page_allocator);
-                        defer trbuf.deinit();
+                        var trbuf: std.ArrayList(u8) = .{};
+                        defer trbuf.deinit(std.heap.page_allocator);
                         try options.tool_format.?.renderToolResultMessage("", contents[i], &trbuf, std.heap.page_allocator);
                         if (pos + trbuf.items.len > buf.len) return error.BufferTooSmall;
                         @memcpy(buf[pos .. pos + trbuf.items.len], trbuf.items);
@@ -946,8 +946,8 @@ pub const Tokenizer = struct {
                     if (!tools_rendered and options.tools.len > 0 and options.tool_format != null and
                         (std.mem.eql(u8, roles[i], "system") or std.mem.eql(u8, roles[i], "developer")))
                     {
-                        var tool_buf = std.ArrayList(u8).init(std.heap.page_allocator);
-                        defer tool_buf.deinit();
+                        var tool_buf: std.ArrayList(u8) = .{};
+                        defer tool_buf.deinit(std.heap.page_allocator);
                         try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, std.heap.page_allocator);
                         if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
                         @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
@@ -962,8 +962,8 @@ pub const Tokenizer = struct {
                 if (!tools_rendered and options.tools.len > 0 and options.tool_format != null) {
                     const open = std.fmt.bufPrint(buf[pos..], "<|im_start|>system", .{}) catch return error.BufferTooSmall;
                     pos += open.len;
-                    var tool_buf = std.ArrayList(u8).init(std.heap.page_allocator);
-                    defer tool_buf.deinit();
+                    var tool_buf: std.ArrayList(u8) = .{};
+                    defer tool_buf.deinit(std.heap.page_allocator);
                     try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, std.heap.page_allocator);
                     if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
                     @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
