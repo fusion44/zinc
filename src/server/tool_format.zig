@@ -446,7 +446,7 @@ test "ChatMLToolFormat.parseAssistantToolCalls extracts a single tool call" {
     try std.testing.expectEqualStrings("call_0", parsed.tool_calls[0].id);
     try std.testing.expectEqualStrings("Bash", parsed.tool_calls[0].name);
     try std.testing.expectEqualStrings(
-        \\{"command": "ls /"}
+        \\{"command":"ls /"}
     , parsed.tool_calls[0].arguments_json);
 }
 
