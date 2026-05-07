@@ -186,3 +186,75 @@ Promote to a real feature design (separate spec) only if:
 - Test 3 produces ≥ 10 tok/s decode
 
 Anything else means we either need to fix the driver path first (BAR, rebar, RADV memory type selection) or that the approach itself does not deliver enough throughput to be useful, and a different mechanism (KV offload, smaller quant, dynamic context) should be explored instead.
+
+## Results (2026-05-07)
+
+**Verdict: clear pass — promote to feature design.**
+
+### Hardware confirmed
+
+- GPU: AMD Radeon RX 9070 XT (RDNA4, Navi 48), reported as `RADV GFX1201`
+- VRAM: 16304 MB, 576 GB/s, 64 CUs, wave64, coopmat=yes
+- PCIe link: Gen 5 x16 (32 GT/s)
+- Resizable BAR: enabled (`Region 0: Memory at f800000000 (64-bit, prefetchable) [size=16G]`)
+- System RAM: 62 GB
+
+### Allocation split (load log)
+
+```
+info(loader): Loaded 733 tensors | 2554 MB device-local VRAM | 18760 MB host-visible (system RAM)
+```
+
+The classifier matched four expert tensor families per layer × 40 layers as expected. Peak host RSS settled around 20.6 GiB total with a light desktop running (Niri compositor, btop). Of that, ~18.7 GiB is the pinned host-visible Vulkan allocation.
+
+### Test 2 — sniff (correctness)
+
+```
+Prompt:  "The capital of France is"
+Output:  "The capital of France is **Paris**."
+```
+
+Coherent. No gibberish, no NaN, no token loops. Confirms RADV serves storage-buffer reads from `HOST_VISIBLE | HOST_COHERENT` memory correctly.
+
+### Test 3 — throughput
+
+| Scenario | Decode tok/s | Notes |
+|---|---:|---|
+| Short prompt, short generation (sniff) | 59.8 | Cache-best — top-8 of 256 experts hot in GPU cache, no PCIe traffic per token |
+| Interactive chat, short context | 13–18 | Sustained, more diverse expert routing |
+| Interactive chat, ~10 K cumulative ctx | 12.3 | Slight drop from KV-read scaling with context length |
+
+The 13–18 tok/s steady-state band matches the pre-test prediction (~15-30 tok/s realistic for Gen 5 x16 with sparse MoE). The 60 tok/s sniff number reflects a best-case where the same handful of experts repeats across all 9 output tokens — not representative of real workloads.
+
+**Prefill** is noticeably slower than decode and is the dominant wait time on long-paste inputs. A 6700-token paste produced a multi-second wait before first output token. This is consistent with two known facts:
+
+1. ZINC's batched prefill path is gated off for `n_experts > 0 || ssm_d_inner > 0`, which is exactly Qwen 3.5/3.6 35B-A3B. So prefill on this model is on the per-token slow path even *without* offload.
+2. Per-token prefill streaming experts over PCIe compounds the issue.
+
+`nvtop` would help diagnose where time is going (compute vs. memory engine), but the user did not run it during this test.
+
+### Two follow-up patches that landed during integration testing
+
+The plan anticipated three commits (`shouldOffloadToHost`, `initHostVisibleStorage`, loader branch). Two more were needed once the model actually loaded:
+
+- `646ff70` — `forward.zig`'s `tensorBytes` was summing all GGUF bytes against the VRAM budget, leaving negative KV budget and aborting engine init with `ContextLengthDoesNotFit`. Fixed by filtering through `loader.shouldOffloadToHost` (made `pub` for the cross-module call).
+- `8f66ad7` — `model_manager.zig` had the same bug in `autoContextTokensForDeviceBudget`, capping interactive sessions at the 4096-token fallback default and producing a misleading `VRAM 21.52 / 15.92 GiB` UI line. Same fix.
+
+After both, the chat UI reports `VRAM 13.51 / 15.92 GiB · ctx reserved 10.94 GiB (71680 tok cap)` — accurate accounting and a usable context budget.
+
+### Caveats and stale numbers
+
+- The `forward.zig` log line `Modeled decode bandwidth: 1016.8 GB/s effective, 576 GB/s theoretical (176.5% utilization, ~17010.5 MB/token)` is wrong: the bandwidth model assumes all weights live in GDDR6, so it overcounts effective bandwidth when most reads come from system RAM. Diagnostic only — does not affect inference correctness.
+- `forward_metal.zig` and `model_manager_metal.zig` have analogous `tensorBytes` helpers. Metal uses unified memory so the bug doesn't manifest, but the code is now technically inconsistent with this branch's mental model. Cleanup, not blocking.
+- The `LoadedTensor.gpu_buffer` doc comment in `loader.zig` and the `Buffer.upload` doc comment in `vulkan/buffer.zig` still describe the pre-offload world. Cosmetic, low priority.
+- The `dmmv_q4k_o_proj_merge.spv` shader was missing on the test machine — pre-existing build issue, unrelated to this branch.
+
+### Recommendation
+
+Promote to a real feature design. Useful next steps:
+
+1. Decide the activation rule — auto-detect via VRAM-fit on `--check`, or an opt-in flag, or both.
+2. Generalize the classifier — fall back to `try device-local, on OOM retry host-visible` for non-MoE architectures (Phase B in the original brainstorm).
+3. Add the `amd-rdna4-16gb` GPU profile to the catalog so `model list` correctly shows the 35B-A3B model as runnable on these cards.
+4. Fix the bandwidth model in `forward.zig` to account for tiered memory residency.
+5. Investigate prefill — the per-token MoE+SSM path was already a known bottleneck on full-VRAM RDNA4; it becomes the dominant pain point with offload. Reactivating batched prefill for this architecture (the cycle-50 work) would help both cases.
