@@ -36,6 +36,20 @@ pub const LoadedTensor = struct {
     gpu_buffer: Buffer,
 };
 
+/// Return true if this GGUF tensor name designates a fused MoE expert weight tensor
+/// that should be allocated in host-visible (system RAM) memory rather than VRAM.
+/// Matches the four suffixes emitted by GGUF for sparse-MoE architectures:
+/// `ffn_gate_exps.weight`, `ffn_up_exps.weight`, `ffn_down_exps.weight`, and
+/// `ffn_down_exps_scale.weight` (Q4_K_M variants only).
+/// Dense tensors and non-expert MoE tensors (router gate, attention, embeddings, etc.)
+/// stay device-local.
+fn shouldOffloadToHost(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, "ffn_gate_exps.weight") or
+        std.mem.endsWith(u8, name, "ffn_up_exps.weight") or
+        std.mem.endsWith(u8, name, "ffn_down_exps.weight") or
+        std.mem.endsWith(u8, name, "ffn_down_exps_scale.weight");
+}
+
 /// Runtime model state backed by a memory-mapped GGUF file and uploaded tensor buffers.
 pub const Model = struct {
     /// Model dimensions and metadata.
@@ -508,6 +522,27 @@ test "parseArchitecture" {
     try std.testing.expectEqual(Architecture.qwen35, parseArchitecture("qwen35"));
     try std.testing.expectEqual(Architecture.mamba, parseArchitecture("mamba"));
     try std.testing.expectEqual(Architecture.unknown, parseArchitecture("gpt2"));
+}
+
+test "shouldOffloadToHost matches MoE expert tensor suffixes" {
+    // Fused per-layer MoE expert tensors — should offload.
+    try std.testing.expect(shouldOffloadToHost("blk.0.ffn_gate_exps.weight"));
+    try std.testing.expect(shouldOffloadToHost("blk.47.ffn_up_exps.weight"));
+    try std.testing.expect(shouldOffloadToHost("blk.7.ffn_down_exps.weight"));
+    // Q4_K_M variants emit a separate per-row scale tensor.
+    try std.testing.expect(shouldOffloadToHost("blk.3.ffn_down_exps_scale.weight"));
+
+    // Non-expert tensors — must stay device-local.
+    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_q.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_k.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_v.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_output.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_gate.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_up.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_down.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_gate_inp.weight"));
+    try std.testing.expect(!shouldOffloadToHost("output.weight"));
+    try std.testing.expect(!shouldOffloadToHost("token_embd.weight"));
 }
 
 test "extractConfig defaults gemma4 attention scale to 1.0" {
