@@ -43,7 +43,7 @@ pub const LoadedTensor = struct {
 /// `ffn_down_exps_scale.weight` (Q4_K_M variants only).
 /// Dense tensors and non-expert MoE tensors (router gate, attention, embeddings, etc.)
 /// stay device-local.
-fn shouldOffloadToHost(name: []const u8) bool {
+pub fn shouldOffloadToHost(name: []const u8) bool {
     return std.mem.endsWith(u8, name, "ffn_gate_exps.weight") or
         std.mem.endsWith(u8, name, "ffn_up_exps.weight") or
         std.mem.endsWith(u8, name, "ffn_down_exps.weight") or
