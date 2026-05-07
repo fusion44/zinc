@@ -1083,7 +1083,7 @@ pub const Tokenizer = struct {
         return @tagName(self.detectTemplateKind());
     }
 
-    fn detectTemplateKind(self: *const Tokenizer) TemplateKind {
+    pub fn detectTemplateKind(self: *const Tokenizer) TemplateKind {
         const tmpl = self.chat_template orelse return .chatml;
         if (std.mem.indexOf(u8, tmpl, "im_start") != null) return .chatml;
         if (std.mem.indexOf(u8, tmpl, "start_header_id") != null) return .llama3;

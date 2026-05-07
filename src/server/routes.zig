@@ -769,6 +769,7 @@ const default_chat_system_prompt =
 const FinishReason = enum {
     stop,
     length,
+    tool_calls,
 };
 
 fn completionFinishReason(requested_max_tokens: u32, effective_max_tokens: u32, produced_tokens: usize) FinishReason {
@@ -830,9 +831,46 @@ const Content = struct {
     }
 };
 
+const HistoricalToolCallFunction = struct {
+    name: []const u8 = "",
+    arguments: []const u8 = "",
+};
+
+const HistoricalToolCall = struct {
+    id: []const u8 = "",
+    type: []const u8 = "function",
+    function: HistoricalToolCallFunction = .{},
+};
+
+const RequestToolFunction = struct {
+    name: []const u8 = "",
+    description: []const u8 = "",
+    parameters: std.json.Value = .null,
+};
+
+const RequestTool = struct {
+    type: []const u8 = "function",
+    function: RequestToolFunction = .{},
+};
+
+pub const ToolChoice = enum { auto, none };
+
+fn parseToolChoice(value: ?std.json.Value) ToolChoice {
+    const v = value orelse return .auto;
+    switch (v) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "none")) return .none;
+            return .auto;
+        },
+        else => return .auto,
+    }
+}
+
 const ChatMessage = struct {
     role: []const u8 = "",
     content: Content = .{},
+    tool_calls: []const HistoricalToolCall = &.{},
+    tool_call_id: []const u8 = "",
 };
 
 const ChatRequestBody = struct {
@@ -844,6 +882,8 @@ const ChatRequestBody = struct {
     temperature: f32 = 0.0,
     top_p: f32 = 1.0,
     enable_thinking: ?bool = null,
+    tools: []const RequestTool = &.{},
+    tool_choice: ?std.json.Value = null,
 };
 
 const ParsedChatRequest = struct {
@@ -856,9 +896,14 @@ const ParsedChatRequest = struct {
     temperature: f32,
     top_p: f32,
     enable_thinking: ?bool,
+    tools: []const tool_format.ToolDefinition,
+    tool_choice: ToolChoice,
+    /// Owns parameters_json strings and tool_calls rendering.
+    arena: std.heap.ArenaAllocator,
 
     fn deinit(self: *ParsedChatRequest) void {
         self.parsed.deinit();
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -866,7 +911,8 @@ const ParsedChatRequest = struct {
 fn countValidChatMessages(messages: []const ChatMessage) usize {
     var count: usize = 0;
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.text.len == 0) continue;
+        if (message.role.len == 0) continue;
+        if (message.content.text.len == 0 and message.tool_calls.len == 0) continue;
         count += 1;
     }
     return count;
@@ -882,8 +928,15 @@ fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const 
     return total;
 }
 
-fn buildChatPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, buf: []u8) ![]const u8 {
-    return tokenizer.applyChatTemplateWithOptions(roles, contents, .{ .enable_thinking = enable_thinking, .skip_thinking_template = skip_thinking_template }, buf);
+fn buildChatPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice, buf: []u8) ![]const u8 {
+    const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
+    const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
+    return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
+        .enable_thinking = enable_thinking,
+        .skip_thinking_template = skip_thinking_template,
+        .tools = tools_for_template,
+        .tool_format = tf,
+    }, buf);
 }
 
 fn buildChatTranscriptPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, buf: []u8) ![]const u8 {
@@ -1007,15 +1060,20 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     });
     errdefer parsed.deinit();
 
-    const arena_allocator = parsed.arena.allocator();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const json_arena_allocator = parsed.arena.allocator();
     const messages = parsed.value.messages;
-    const roles = try arena_allocator.alloc([]const u8, messages.len + 1);
-    const contents = try arena_allocator.alloc([]const u8, messages.len + 1);
+    const roles = try json_arena_allocator.alloc([]const u8, messages.len + 1);
+    const contents = try json_arena_allocator.alloc([]const u8, messages.len + 1);
 
     var count: usize = 0;
     var has_guiding_message = false;
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.text.len == 0) continue;
+        if (message.role.len == 0) continue;
+        if (message.content.text.len == 0 and message.tool_calls.len == 0) continue;
         if (std.mem.eql(u8, message.role, "system") or std.mem.eql(u8, message.role, "developer")) {
             has_guiding_message = true;
         }
@@ -1033,13 +1091,41 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     }
 
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.text.len == 0) continue;
+        if (message.role.len == 0) continue;
+        // Assistant message with tool_calls but no text content — render as <tool_call> blocks
+        if (std.mem.eql(u8, message.role, "assistant") and message.content.text.len == 0 and message.tool_calls.len > 0) {
+            var rendered: std.ArrayList(u8) = .{};
+            for (message.tool_calls) |tc| {
+                try rendered.appendSlice(arena_alloc, "<tool_call>\n{\"name\": \"");
+                try rendered.appendSlice(arena_alloc, tc.function.name);
+                try rendered.appendSlice(arena_alloc, "\", \"arguments\": ");
+                try rendered.appendSlice(arena_alloc, tc.function.arguments);
+                try rendered.appendSlice(arena_alloc, "}\n</tool_call>\n");
+            }
+            roles[count] = "assistant";
+            contents[count] = try rendered.toOwnedSlice(arena_alloc);
+            count += 1;
+            continue;
+        }
+        if (message.content.text.len == 0) continue;
         roles[count] = message.role;
         contents[count] = if (std.mem.eql(u8, message.role, "assistant"))
             sanitizeAssistantHistoryContent(message.content.text)
         else
             message.content.text;
         count += 1;
+    }
+
+    // Convert RequestTool → ToolDefinition
+    const tools_in = parsed.value.tools;
+    const tools_out = try arena_alloc.alloc(tool_format.ToolDefinition, tools_in.len);
+    for (tools_in, 0..) |t, ti| {
+        const params_json = try std.json.Stringify.valueAlloc(arena_alloc, t.function.parameters, .{});
+        tools_out[ti] = .{
+            .name = t.function.name,
+            .description = t.function.description,
+            .parameters_json = params_json,
+        };
     }
 
     return .{
@@ -1052,6 +1138,9 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         .temperature = parsed.value.temperature,
         .top_p = parsed.value.top_p,
         .enable_thinking = parsed.value.enable_thinking,
+        .tools = tools_out,
+        .tool_choice = parseToolChoice(parsed.value.tool_choice),
+        .arena = arena,
     };
 }
 fn findFirstStop(text: []const u8, stop_strs: []const []const u8) ?usize {
@@ -1696,7 +1785,7 @@ fn handleChatCompletions(
     };
     defer allocator.free(prompt_buf);
 
-    const prompt = buildChatPrompt(tokenizer, parsed.roles, parsed.contents, parsed.enable_thinking, skip_thinking_template, prompt_buf) catch |err| {
+    const prompt = buildChatPrompt(tokenizer, parsed.roles, parsed.contents, parsed.enable_thinking, skip_thinking_template, parsed.tools, parsed.tool_choice, prompt_buf) catch |err| {
         if (err == error.BufferTooSmall) {
             try conn.sendError(400, "invalid_request_error", "Prompt too long");
             return;
@@ -1858,6 +1947,16 @@ fn handleChatCompletions(
         var stopped = false;
         var finish_reason: FinishReason = if (max_tokens == 0 and parsed.max_tokens > 0) .length else .stop;
 
+        // Streaming tool-call detector
+        const stream_tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
+        const stream_detector = try stream_tool_fmt.newStreamingDetector(allocator);
+        defer {
+            stream_detector.deinit();
+            allocator.destroy(stream_detector);
+        }
+        var any_tool_call_emitted = false;
+        var tool_call_index: u32 = 0;
+
         if (max_tokens > 0) {
             var prev_token = runtime.sample(engine, &state, sampling, random);
             var generated: u32 = 0;
@@ -1937,7 +2036,7 @@ fn handleChatCompletions(
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     gen_text_len = sent_text_len + cleaned_pending.len;
                     if (cleaned_pending.len > 0) {
-                        streamText(conn, cleaned_pending, req_id, ts, model_name) catch return;
+                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
                     }
                     sent_text_len = gen_text_len;
                     stopped = true;
@@ -1970,14 +2069,14 @@ fn handleChatCompletions(
                         const pending_slice = gen_text_buf[sent_text_len..gen_text_len];
                         const safe_end_rel = lastCompleteUtf8End(pending_slice);
                         if (safe_end_rel > 0) {
-                            streamText(conn, pending_slice[0..safe_end_rel], req_id, ts, model_name) catch return;
+                            streamTextViaDetector(conn, pending_slice[0..safe_end_rel], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
                         }
                         sent_text_len += safe_end_rel;
                     } else {
                         const visible = stripThinkingForDisabledResponse(gen_text_buf[0..gen_text_len], &visible_buf) catch gen_text_buf[0..gen_text_len];
                         const safe_visible = lastCompleteUtf8End(visible);
                         if (safe_visible > sent_visible_len) {
-                            streamText(conn, visible[sent_visible_len..safe_visible], req_id, ts, model_name) catch return;
+                            streamTextViaDetector(conn, visible[sent_visible_len..safe_visible], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
                             sent_visible_len = safe_visible;
                         }
                         sent_text_len = gen_text_len;
@@ -2007,19 +2106,29 @@ fn handleChatCompletions(
                     const pending_text = gen_text_buf[sent_text_len..gen_text_len];
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     if (cleaned_pending.len > 0) {
-                        streamText(conn, cleaned_pending, req_id, ts, model_name) catch return;
+                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
                     }
                 } else {
                     const visible = stripThinkingForDisabledResponse(gen_text_buf[0..gen_text_len], &visible_buf) catch gen_text_buf[0..gen_text_len];
                     const cleaned_visible = trimTrailingChatArtifacts(visible);
                     if (cleaned_visible.len > sent_visible_len) {
-                        streamText(conn, cleaned_visible[sent_visible_len..], req_id, ts, model_name) catch return;
+                        streamTextViaDetector(conn, cleaned_visible[sent_visible_len..], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
                     }
+                }
+            }
+            // Flush detector tail (bytes held while waiting for a potential tool call tag)
+            {
+                const tail = stream_detector.finalize();
+                if (tail.len > 0) {
+                    streamText(conn, tail, req_id, ts, model_name) catch return;
                 }
             }
         }
 
         // Final chunk with finish_reason
+        if (any_tool_call_emitted and finish_reason == .stop) {
+            finish_reason = .tool_calls;
+        }
         {
             var chunk_buf: [1024]u8 = undefined;
             const chunk = std.fmt.bufPrint(&chunk_buf,
@@ -2092,21 +2201,59 @@ fn handleChatCompletions(
             sanitizeThinkingOutput(prefixed_text, &sanitized_thinking_buf) catch prefixed_text
         else
             prefixed_text;
-        var escaped_buf: [16384]u8 = undefined;
-        const escaped_text = jsonEscape(response_text, &escaped_buf);
 
-        var resp_buf: [32768]u8 = undefined;
-        const resp = std.fmt.bufPrint(&resp_buf,
-            \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-        , .{
-            req_id,       ts,                         model_name,
-            escaped_text, @tagName(finish_reason),    prompt_tokens.len,
-            ns_gen,       prompt_tokens.len + ns_gen,
-        }) catch {
-            try conn.sendError(500, "internal_error", "Response too large");
-            return;
-        };
-        try conn.sendJson(200, resp);
+        // Parse tool calls from the response text
+        const tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
+        const parsed_output = try tool_fmt.parseAssistantToolCalls(response_text, allocator);
+        defer {
+            for (parsed_output.tool_calls) |c| {
+                allocator.free(c.id);
+                allocator.free(c.name);
+                allocator.free(c.arguments_json);
+            }
+            allocator.free(parsed_output.tool_calls);
+            allocator.free(parsed_output.text_content);
+        }
+
+        if (parsed_output.tool_calls.len > 0 and finish_reason == .stop) {
+            finish_reason = .tool_calls;
+        }
+
+        if (parsed_output.tool_calls.len > 0) {
+            // Emit response with tool_calls, content null
+            var wb = std.ArrayList(u8).init(allocator);
+            defer wb.deinit();
+            try wb.writer().print(
+                \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":[
+            , .{ req_id, ts, model_name });
+            for (parsed_output.tool_calls, 0..) |tc, ti| {
+                if (ti > 0) try wb.appendSlice(",");
+                var args_esc_buf: [16384]u8 = undefined;
+                const args_esc = jsonEscape(tc.arguments_json, &args_esc_buf);
+                try wb.writer().print(
+                    \\{{"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
+                , .{ tc.id, tc.name, args_esc });
+            }
+            try wb.writer().print(
+                \\]}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+            , .{ @tagName(finish_reason), prompt_tokens.len, ns_gen, prompt_tokens.len + ns_gen });
+            try conn.sendJson(200, wb.items);
+        } else {
+            var escaped_buf: [16384]u8 = undefined;
+            const escaped_text = jsonEscape(response_text, &escaped_buf);
+            var resp_fixed_buf: [32768]u8 = undefined;
+            const resp = std.fmt.bufPrint(&resp_fixed_buf,
+                \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+            , .{
+                req_id,       ts,                         model_name,
+                escaped_text, @tagName(finish_reason),    prompt_tokens.len,
+                ns_gen,       prompt_tokens.len + ns_gen,
+            }) catch {
+                try conn.sendError(500, "internal_error", "Response too large");
+                return;
+            };
+            try conn.sendJson(200, resp);
+        }
         if (cacheable_session) {
             var transport_buf: [32768]u8 = undefined;
             const transport_text = historyAssistantContent(tokenizer, response_text, &transport_buf) catch response_text;
@@ -2586,6 +2733,49 @@ fn streamText(
     try conn.writeSseEvent(chunk);
 }
 
+/// Send content text through the streaming detector.
+/// Returns whether we should stop streaming (peer closed, etc.).
+fn streamTextViaDetector(
+    conn: *http.Connection,
+    text: []const u8,
+    req_id: []const u8,
+    ts: i64,
+    model_name: []const u8,
+    detector: *tool_format.StreamingDetector,
+    any_tool_call_emitted: *bool,
+    tool_call_index: *u32,
+    allocator: std.mem.Allocator,
+) !void {
+    const fr = try detector.feed(text);
+    switch (fr) {
+        .emit_as_content => {
+            const c = detector.takeContentDelta();
+            if (c.len > 0) try streamText(conn, c, req_id, ts, model_name);
+        },
+        .hold => {},
+        .tool_call_complete => {
+            const c = detector.takeContentDelta();
+            if (c.len > 0) try streamText(conn, c, req_id, ts, model_name);
+            while (detector.takePendingToolCall()) |tc| {
+                defer {
+                    allocator.free(tc.id);
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments_json);
+                }
+                var args_esc_buf: [16384]u8 = undefined;
+                const args_esc = jsonEscape(tc.arguments_json, &args_esc_buf);
+                var ev_buf: [32768]u8 = undefined;
+                const ev = std.fmt.bufPrint(&ev_buf,
+                    \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]}},"finish_reason":null}}]}}
+                , .{ req_id, ts, model_name, tool_call_index.*, tc.id, tc.name, args_esc }) catch return error.BufferTooSmall;
+                try conn.writeSseEvent(ev);
+                any_tool_call_emitted.* = true;
+                tool_call_index.* += 1;
+            }
+        },
+    }
+}
+
 // ── Built-in Chat UI ─────────────────────────────────────────
 
 fn serveChatUi(conn: *http.Connection) !void {
@@ -2839,7 +3029,7 @@ test "buildChatPrompt uses tokenizer chat template helper" {
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, null, false, &buf);
+    const prompt = try buildChatPrompt(&tok, &roles, &contents, null, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>system\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not output labels like 'Thinking Process:'") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
@@ -3026,7 +3216,7 @@ test "buildChatPrompt uses qwen no-thinking generation suffix when template requ
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, null, false, &buf);
+    const prompt = try buildChatPrompt(&tok, &roles, &contents, null, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 }
@@ -3047,7 +3237,7 @@ test "buildChatPrompt enables thinking when requested" {
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, true, false, &buf);
+    const prompt = try buildChatPrompt(&tok, &roles, &contents, true, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "</think>") == null);
@@ -3170,6 +3360,49 @@ test "parseChatRequest accepts null content (assistant tool-call message)" {
     try std.testing.expectEqualStrings("follow up", parsed.contents[2]);
 }
 
+test "parseChatRequest parses tools and tool_choice" {
+    const body =
+        \\{"messages":[{"role":"user","content":"what time is it?"}],"tools":[{"type":"function","function":{"name":"get_time","description":"Get current time","parameters":{"type":"object"}}}],"tool_choice":"auto"}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.tools.len);
+    try std.testing.expectEqualStrings("get_time", parsed.tools[0].name);
+    try std.testing.expectEqualStrings("Get current time", parsed.tools[0].description);
+    try std.testing.expectEqual(ToolChoice.auto, parsed.tool_choice);
+}
+
+test "parseChatRequest tool_choice none suppresses tools" {
+    const body =
+        \\{"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"fn1","description":"d","parameters":null}}],"tool_choice":"none"}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(ToolChoice.none, parsed.tool_choice);
+    // tools array is still populated; callers use tool_choice to decide whether to render them
+    try std.testing.expectEqual(@as(usize, 1), parsed.tools.len);
+}
+
+test "parseChatRequest replays assistant tool_calls as tool_call blocks" {
+    const body =
+        \\{"messages":[{"role":"user","content":"call it"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_time","arguments":"{}"}}]},{"role":"tool","content":"12:00","tool_call_id":"c1"},{"role":"user","content":"thanks"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    // Expect: system + user + assistant(tool_call) + tool + user = 5 messages
+    // (default system is prepended since no system message)
+    var found_tool_call_block = false;
+    for (parsed.contents) |c| {
+        if (std.mem.indexOf(u8, c, "<tool_call>") != null) {
+            found_tool_call_block = true;
+            try std.testing.expect(std.mem.indexOf(u8, c, "get_time") != null);
+        }
+    }
+    try std.testing.expect(found_tool_call_block);
+}
 test "prefixThinkingEnvelope adds think prefix when enabled" {
     var buf: [128]u8 = undefined;
     const prefixed = try prefixThinkingEnvelope("17 * 24 = 408\n</think>\n408", true, &buf);
