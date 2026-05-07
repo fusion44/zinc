@@ -7,6 +7,13 @@ const TemplateKind = @import("../model/tokenizer.zig").Tokenizer.TemplateKind;
 
 const log = std.log.scoped(.tool_format);
 
+var global_tool_call_id = std.atomic.Value(u64).init(0);
+
+fn allocToolCallId(allocator: std.mem.Allocator) ![]u8 {
+    const id = global_tool_call_id.fetchAdd(1, .monotonic);
+    return std.fmt.allocPrint(allocator, "call_{d}", .{id});
+}
+
 /// One tool definition extracted from the request's `tools` array.
 pub const ToolDefinition = struct {
     name: []const u8,
@@ -47,7 +54,6 @@ pub const StreamingDetector = struct {
     hold_buf: std.ArrayList(u8) = .{},
     /// Tool calls fully parsed and waiting for the caller to drain.
     pending_calls: std.ArrayList(ToolCall) = .{},
-    next_id: u32 = 0,
     allocator: std.mem.Allocator,
 
     /// Maximum bytes to hold while waiting for an open tag to disambiguate.
@@ -122,9 +128,8 @@ pub const StreamingDetector = struct {
                 const args_str = try std.json.Stringify.valueAlloc(self.allocator, args_val, .{});
                 errdefer self.allocator.free(args_str);
 
-                const id = try std.fmt.allocPrint(self.allocator, "call_{d}", .{self.next_id});
+                const id = try allocToolCallId(self.allocator);
                 errdefer self.allocator.free(id);
-                self.next_id += 1;
 
                 const name_owned = try self.allocator.dupe(u8, name);
                 errdefer self.allocator.free(name_owned);
@@ -411,8 +416,6 @@ fn chatml_parse_calls(
     errdefer text_buf.deinit(allocator);
 
     var search_from: usize = 0;
-    var next_id: u32 = 0;
-
     while (std.mem.indexOfPos(u8, model_output, search_from, tool_call_open)) |open_at| {
         // Append text between search_from and open_at to text_buf.
         try text_buf.appendSlice(allocator, model_output[search_from..open_at]);
@@ -467,8 +470,7 @@ fn chatml_parse_calls(
         errdefer allocator.free(args_json);
 
         // Build the id string.
-        const id_str = try std.fmt.allocPrint(allocator, "call_{d}", .{next_id});
-        next_id += 1;
+        const id_str = try allocToolCallId(allocator);
         errdefer allocator.free(id_str);
 
         const name_owned = try allocator.dupe(u8, name_str);
@@ -578,7 +580,7 @@ test "ChatMLToolFormat.parseAssistantToolCalls extracts a single tool call" {
 
     try std.testing.expectEqualStrings("Let me check that.\n", parsed.text_content);
     try std.testing.expectEqual(@as(usize, 1), parsed.tool_calls.len);
-    try std.testing.expectEqualStrings("call_0", parsed.tool_calls[0].id);
+    try std.testing.expect(parsed.tool_calls[0].id.len > 0);
     try std.testing.expectEqualStrings("Bash", parsed.tool_calls[0].name);
     try std.testing.expectEqualStrings(
         \\{"command":"ls /"}
@@ -608,9 +610,10 @@ test "ChatMLToolFormat.parseAssistantToolCalls extracts multiple parallel calls"
     }
 
     try std.testing.expectEqual(@as(usize, 2), parsed.tool_calls.len);
-    try std.testing.expectEqualStrings("call_0", parsed.tool_calls[0].id);
+    try std.testing.expect(parsed.tool_calls[0].id.len > 0);
     try std.testing.expectEqualStrings("Bash", parsed.tool_calls[0].name);
-    try std.testing.expectEqualStrings("call_1", parsed.tool_calls[1].id);
+    try std.testing.expect(parsed.tool_calls[1].id.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, parsed.tool_calls[0].id, parsed.tool_calls[1].id));
     try std.testing.expectEqualStrings("Read", parsed.tool_calls[1].name);
     try std.testing.expectEqualStrings("Let me run two commands.\n", parsed.text_content);
 }
@@ -637,9 +640,9 @@ test "ChatMLToolFormat.parseAssistantToolCalls falls back to text on malformed J
         std.testing.allocator.free(parsed.text_content);
     }
 
-    // The valid call still extracted; id is "call_0" since malformed didn't get an id.
+    // The valid call still extracted and gets a non-empty id.
     try std.testing.expectEqual(@as(usize, 1), parsed.tool_calls.len);
-    try std.testing.expectEqualStrings("call_0", parsed.tool_calls[0].id);
+    try std.testing.expect(parsed.tool_calls[0].id.len > 0);
     try std.testing.expectEqualStrings("OK", parsed.tool_calls[0].name);
     // The malformed block (with tags) appears in text_content.
     try std.testing.expect(std.mem.indexOf(u8, parsed.text_content, "<tool_call>\n{not valid json}\n</tool_call>") != null);
@@ -719,7 +722,7 @@ test "StreamingDetector.feed emits prefix content before tool_call_complete" {
         std.testing.allocator.free(call.arguments_json);
     }
     try std.testing.expectEqualStrings("X", call.name);
-    try std.testing.expectEqualStrings("call_0", call.id);
+    try std.testing.expect(call.id.len > 0);
 }
 
 test "StreamingDetector flushes false-positive partial tag as content" {

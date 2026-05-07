@@ -2838,7 +2838,7 @@ fn formatStreamingToolCallChunk(
         }
     }
 
-    try wb.appendSlice(allocator, "\"}}}]},\"finish_reason\":null}}]}");
+    try wb.appendSlice(allocator, "\"}}]},\"finish_reason\":null}]}");
     return wb.toOwnedSlice(allocator);
 }
 
@@ -3402,6 +3402,44 @@ test "formatStreamingToolCallChunk handles large arguments payloads" {
     try std.testing.expect(std.mem.indexOf(u8, chunk, "\"name\":\"shell\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, chunk, "\"arguments\":\"{\\\"path\\\":\\\"") != null);
     try std.testing.expect(chunk.len > 24000);
+}
+
+test "formatStreamingToolCallChunk emits valid JSON" {
+    const chunk = try formatStreamingToolCallChunk(
+        std.testing.allocator,
+        "chatcmpl-test",
+        123,
+        "Qwen3.6-35B-A3B",
+        0,
+        "call_0",
+        "tree",
+        "{\"path\":\"/home/f44/dev/stuff/pwmedia\",\"depth\":3}",
+    );
+    defer std.testing.allocator.free(chunk);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, chunk, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .object);
+    const choices = parsed.value.object.get("choices") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(choices == .array);
+    try std.testing.expectEqual(@as(usize, 1), choices.array.items.len);
+
+    const choice0 = choices.array.items[0];
+    try std.testing.expect(choice0 == .object);
+    const delta = choice0.object.get("delta") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(delta == .object);
+    const tool_calls = delta.object.get("tool_calls") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(tool_calls == .array);
+    try std.testing.expectEqual(@as(usize, 1), tool_calls.array.items.len);
+
+    const tool0 = tool_calls.array.items[0];
+    try std.testing.expect(tool0 == .object);
+    const function = tool0.object.get("function") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(function == .object);
+    const arguments = function.object.get("arguments") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(arguments == .string);
+    try std.testing.expectEqualStrings("{\"path\":\"/home/f44/dev/stuff/pwmedia\",\"depth\":3}", arguments.string);
 }
 
 test "parseChatRequest preserves full message history" {
