@@ -948,6 +948,37 @@ fn buildChatPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []c
     }, buf);
 }
 
+fn allocChatPrompt(
+    allocator: std.mem.Allocator,
+    tokenizer: *const tokenizer_mod.Tokenizer,
+    roles: []const []const u8,
+    contents: []const []const u8,
+    enable_thinking: ?bool,
+    skip_thinking_template: bool,
+    tools: []const tool_format.ToolDefinition,
+    tool_choice: ToolChoice,
+) ![]u8 {
+    var capacity = estimateChatPromptBytes(roles, contents, supportsEnabledThinking(tokenizer, enable_thinking), tools);
+    var attempts: u8 = 0;
+    while (attempts < 4) : (attempts += 1) {
+        const prompt_buf = try allocator.alloc(u8, capacity);
+        errdefer allocator.free(prompt_buf);
+
+        const prompt = buildChatPrompt(tokenizer, roles, contents, enable_thinking, skip_thinking_template, tools, tool_choice, prompt_buf) catch |err| {
+            allocator.free(prompt_buf);
+            if (err == error.BufferTooSmall) {
+                capacity *= 2;
+                continue;
+            }
+            return err;
+        };
+
+        return prompt_buf[0..prompt.len];
+    }
+
+    return error.BufferTooSmall;
+}
+
 fn buildChatTranscriptPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, buf: []u8) ![]const u8 {
     return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
         .add_generation_prompt = false,
@@ -1787,14 +1818,11 @@ fn handleChatCompletions(
     }
     defer runtime.setLogitsReadbackEnabled(engine, previous_logits_readback);
 
-    const prompt_capacity = estimateChatPromptBytes(parsed.roles, parsed.contents, supportsEnabledThinking(tokenizer, parsed.enable_thinking), parsed.tools);
-    const prompt_buf = allocator.alloc(u8, prompt_capacity) catch {
-        try conn.sendError(500, "internal_error", "Prompt allocation failed");
-        return;
-    };
-    defer allocator.free(prompt_buf);
-
-    const prompt = buildChatPrompt(tokenizer, parsed.roles, parsed.contents, parsed.enable_thinking, skip_thinking_template, parsed.tools, parsed.tool_choice, prompt_buf) catch |err| {
+    const prompt = allocChatPrompt(allocator, tokenizer, parsed.roles, parsed.contents, parsed.enable_thinking, skip_thinking_template, parsed.tools, parsed.tool_choice) catch |err| {
+        if (err == error.OutOfMemory) {
+            try conn.sendError(500, "internal_error", "Prompt allocation failed");
+            return;
+        }
         if (err == error.BufferTooSmall) {
             try conn.sendError(400, "invalid_request_error", "Prompt too long");
             return;
@@ -1802,6 +1830,7 @@ fn handleChatCompletions(
         try conn.sendError(500, "internal_error", "Prompt formatting failed");
         return;
     };
+    defer allocator.free(prompt);
 
     // Tokenize
     // `encode` uses the tokenizer's allocator, which differs from the per-request
@@ -2771,18 +2800,46 @@ fn streamTextViaDetector(
                     allocator.free(tc.name);
                     allocator.free(tc.arguments_json);
                 }
-                var args_esc_buf: [16384]u8 = undefined;
-                const args_esc = jsonEscape(tc.arguments_json, &args_esc_buf);
-                var ev_buf: [32768]u8 = undefined;
-                const ev = std.fmt.bufPrint(&ev_buf,
-                    \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]}},"finish_reason":null}}]}}
-                , .{ req_id, ts, model_name, tool_call_index.*, tc.id, tc.name, args_esc }) catch return error.BufferTooSmall;
+                const ev = try formatStreamingToolCallChunk(allocator, req_id, ts, model_name, tool_call_index.*, tc.id, tc.name, tc.arguments_json);
+                defer allocator.free(ev);
                 try conn.writeSseEvent(ev);
                 any_tool_call_emitted.* = true;
                 tool_call_index.* += 1;
             }
         },
     }
+}
+
+fn formatStreamingToolCallChunk(
+    allocator: std.mem.Allocator,
+    req_id: []const u8,
+    ts: i64,
+    model_name: []const u8,
+    tool_call_index: u32,
+    id: []const u8,
+    name: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    var wb: std.ArrayList(u8) = .{};
+    errdefer wb.deinit(allocator);
+
+    try wb.writer(allocator).print(
+        \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"
+    , .{ req_id, ts, model_name, tool_call_index, id, name });
+
+    for (arguments_json) |c| {
+        switch (c) {
+            '"' => try wb.appendSlice(allocator, "\\\""),
+            '\\' => try wb.appendSlice(allocator, "\\\\"),
+            '\n' => try wb.appendSlice(allocator, "\\n"),
+            '\r' => try wb.appendSlice(allocator, "\\r"),
+            '\t' => try wb.appendSlice(allocator, "\\t"),
+            else => try wb.append(allocator, c),
+        }
+    }
+
+    try wb.appendSlice(allocator, "\"}}}]},\"finish_reason\":null}}]}");
+    return wb.toOwnedSlice(allocator);
 }
 
 // ── Built-in Chat UI ─────────────────────────────────────────
@@ -3250,6 +3307,101 @@ test "buildChatPrompt enables thinking when requested" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "</think>") == null);
+}
+
+test "buildChatPrompt succeeds for large Goose-style tool prompts" {
+    var tok = makeTestTokenizer(null);
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{
+        "system",
+        "user",
+    };
+    const contents = [_][]const u8{
+        "You are a general-purpose AI agent called goose, created by AAIF (Agentic AI Foundation).\n" ++
+            "goose is being developed as an open-source software project.\n\n" ++
+            "# Extensions\n\n" ++
+            "Extensions provide additional tools and context from different data sources and applications.\n" ++
+            "You can dynamically enable or disable extensions as needed to help complete tasks.\n\n" ++
+            "Because you dynamically load extensions, your conversation history may refer\n" ++
+            "to interactions with extensions that are not currently active. The currently\n" ++
+            "active extensions are below. Each of these extensions provides tools that are\n" ++
+            "in your tool specification.\n\n" ++
+            "## developer\n\n" ++
+            "### Instructions\n" ++
+            "Use the developer extension to build software and operate a terminal.\n\n" ++
+            "Make sure to use the tools efficiently and minimize unnecessary turns.\n",
+        "hello",
+    };
+
+    const tools = [_]tool_format.ToolDefinition{
+        .{
+            .name = "analyze",
+            .description = "Analyze code structure in 3 modes.",
+            .parameters_json =
+            \\{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"AnalyzeParams","type":"object","properties":{"path":{"description":"File or directory path to analyze","type":"string"},"focus":{"description":"Symbol name to focus on","type":["string","null"],"default":null},"max_depth":{"description":"Directory recursion depth limit","type":"integer","minimum":0,"default":3},"follow_depth":{"description":"Call graph traversal depth","type":"integer","minimum":0,"default":2},"force":{"description":"Allow large outputs without size warning","type":"boolean","default":false}},"required":["path"]}
+            ,
+        },
+        .{
+            .name = "delegate",
+            .description = "Delegate a task to a subagent that runs independently with its own context.",
+            .parameters_json =
+            \\{"type":"object","properties":{"instructions":{"type":"string"},"source":{"type":"string"},"parameters":{"type":"object","additionalProperties":true},"extensions":{"type":"array","items":{"type":"string"}},"provider":{"type":"string"},"model":{"type":"string"},"temperature":{"type":"number"},"max_turns":{"type":"integer","minimum":1},"async":{"type":"boolean","default":false}},"required":[]}
+            ,
+        },
+        .{
+            .name = "shell",
+            .description = "Execute a shell command in the current dir.",
+            .parameters_json =
+            \\{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"ShellParams","type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":["integer","null"],"minimum":0,"default":null}},"required":["command"]}
+            ,
+        },
+    };
+
+    const estimated = estimateChatPromptBytes(&roles, &contents, false, &tools);
+    const prompt_buf = try std.testing.allocator.alloc(u8, estimated);
+    defer std.testing.allocator.free(prompt_buf);
+
+    const prompt = buildChatPrompt(&tok, &roles, &contents, null, false, &tools, .auto, prompt_buf) catch |err| {
+        if (err == error.BufferTooSmall) {
+            std.debug.print("estimated={d}\n", .{estimated});
+        }
+        return err;
+    };
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<tools>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "delegate") != null);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n"));
+}
+
+test "formatStreamingToolCallChunk handles large arguments payloads" {
+    var big_args: [24000]u8 = undefined;
+    @memset(&big_args, 'a');
+
+    const prefix = "{\"path\":\"";
+    const suffix = "\"}";
+    var args: std.ArrayList(u8) = .{};
+    defer args.deinit(std.testing.allocator);
+    try args.appendSlice(std.testing.allocator, prefix);
+    try args.appendSlice(std.testing.allocator, &big_args);
+    try args.appendSlice(std.testing.allocator, suffix);
+
+    const chunk = try formatStreamingToolCallChunk(
+        std.testing.allocator,
+        "chatcmpl-test",
+        123,
+        "qwen36-35b-a3b-q4k-xl",
+        0,
+        "call_0",
+        "shell",
+        args.items,
+    );
+    defer std.testing.allocator.free(chunk);
+
+    try std.testing.expect(std.mem.indexOf(u8, chunk, "\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk, "\"name\":\"shell\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk, "\"arguments\":\"{\\\"path\\\":\\\"") != null);
+    try std.testing.expect(chunk.len > 24000);
 }
 
 test "parseChatRequest preserves full message history" {
